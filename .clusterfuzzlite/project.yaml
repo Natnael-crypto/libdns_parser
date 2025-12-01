@@ -1,0 +1,7 @@
+language: c
+sanitizers:
+  - address
+  - undefined
+fuzz_targets:
+  - dns_msg_fuzzer
+  - dns_cache_fuzzer
