@@ -83,3 +83,4 @@ int dns_name_compress(const char *name, uint8_t *buf, size_t buf_len)
     buf[written++] = 0x00; /* root label */
     return (int)written;
 }
+/* version: v1.0.1 */
