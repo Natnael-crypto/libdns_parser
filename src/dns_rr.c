@@ -217,3 +217,4 @@ void dns_rr_chain_free(DnsRR *head)
         cur = next;
     }
 }
+/* version: v1.0.2 */
