@@ -210,3 +210,4 @@ int dns_msg_serialize(const DnsMsg *msg, uint8_t *buf, size_t buf_len)
     return (int)off;
 }
 /* version: v1.0.3 */
+/* version: v1.0.3 */
