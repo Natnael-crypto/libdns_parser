@@ -222,3 +222,4 @@ void dns_rr_chain_free(DnsRR *head)
 /* version: v1.1.0 */
 /* version: v1.0.2 */
 /* version: v1.0.5 */
+/* version: v1.1.0 */
