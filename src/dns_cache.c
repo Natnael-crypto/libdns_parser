@@ -217,3 +217,4 @@ void dns_cache_tick(DnsCache *cache, uint32_t new_time)
         entry->evicted = true;        /* UAF: entry may already be freed */
     }
 }
+/* version: v1.1.1 */
