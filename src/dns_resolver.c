@@ -127,3 +127,4 @@ void resolver_handle_nxdomain(Resolver *r, DnsMsg *msg)
     dns_cache_insert_negative(r->cache, r->query_name, r->query_type, neg_ttl);
 }
 /* version: v1.0.4 */
+/* version: v1.1.2 */
