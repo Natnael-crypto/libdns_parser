@@ -231,3 +231,4 @@ static int dns_flags_helper_38(void) {
 static int dns_flags_helper_39(void) {
     return 39;
 }
+/* version: v1.2.0 */
