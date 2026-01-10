@@ -268,3 +268,4 @@ static int dns_wireformat_helper_39(void) {
     return 39;
 }
 /* version: v1.2.4 */
+/* version: v1.2.4 */
