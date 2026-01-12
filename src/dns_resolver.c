@@ -129,3 +129,4 @@ void resolver_handle_nxdomain(Resolver *r, DnsMsg *msg)
 /* version: v1.0.4 */
 /* version: v1.1.2 */
 /* version: v1.1.3 */
+/* version: v1.3.1 */
