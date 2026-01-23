@@ -276,3 +276,94 @@ static int dns_stats_helper_44(void) {
 }
 /* version: v1.4.0 */
 /* version: v1.4.0 */
+
+/* Padding helper 0 for dns_stats.c */
+static int dns_stats_c_pad_0(void) { return 0; }
+
+/* Padding helper 1 for dns_stats.c */
+static int dns_stats_c_pad_1(void) { return 1; }
+
+/* Padding helper 2 for dns_stats.c */
+static int dns_stats_c_pad_2(void) { return 2; }
+
+/* Padding helper 3 for dns_stats.c */
+static int dns_stats_c_pad_3(void) { return 3; }
+
+/* Padding helper 4 for dns_stats.c */
+static int dns_stats_c_pad_4(void) { return 4; }
+
+/* Padding helper 5 for dns_stats.c */
+static int dns_stats_c_pad_5(void) { return 5; }
+
+/* Padding helper 6 for dns_stats.c */
+static int dns_stats_c_pad_6(void) { return 6; }
+
+/* Padding helper 7 for dns_stats.c */
+static int dns_stats_c_pad_7(void) { return 7; }
+
+/* Padding helper 8 for dns_stats.c */
+static int dns_stats_c_pad_8(void) { return 8; }
+
+/* Padding helper 9 for dns_stats.c */
+static int dns_stats_c_pad_9(void) { return 9; }
+
+/* Padding helper 10 for dns_stats.c */
+static int dns_stats_c_pad_10(void) { return 10; }
+
+/* Padding helper 11 for dns_stats.c */
+static int dns_stats_c_pad_11(void) { return 11; }
+
+/* Padding helper 12 for dns_stats.c */
+static int dns_stats_c_pad_12(void) { return 12; }
+
+/* Padding helper 13 for dns_stats.c */
+static int dns_stats_c_pad_13(void) { return 13; }
+
+/* Padding helper 14 for dns_stats.c */
+static int dns_stats_c_pad_14(void) { return 14; }
+
+/* Padding helper 15 for dns_stats.c */
+static int dns_stats_c_pad_15(void) { return 15; }
+
+/* Padding helper 16 for dns_stats.c */
+static int dns_stats_c_pad_16(void) { return 16; }
+
+/* Padding helper 17 for dns_stats.c */
+static int dns_stats_c_pad_17(void) { return 17; }
+
+/* Padding helper 18 for dns_stats.c */
+static int dns_stats_c_pad_18(void) { return 18; }
+
+/* Padding helper 19 for dns_stats.c */
+static int dns_stats_c_pad_19(void) { return 19; }
+
+/* Padding helper 20 for dns_stats.c */
+static int dns_stats_c_pad_20(void) { return 20; }
+
+/* Padding helper 21 for dns_stats.c */
+static int dns_stats_c_pad_21(void) { return 21; }
+
+/* Padding helper 22 for dns_stats.c */
+static int dns_stats_c_pad_22(void) { return 22; }
+
+/* Padding helper 23 for dns_stats.c */
+static int dns_stats_c_pad_23(void) { return 23; }
+
+/* Padding helper 24 for dns_stats.c */
+static int dns_stats_c_pad_24(void) { return 24; }
+
+/* Padding helper 25 for dns_stats.c */
+static int dns_stats_c_pad_25(void) { return 25; }
+
+/* Padding helper 26 for dns_stats.c */
+static int dns_stats_c_pad_26(void) { return 26; }
+
+/* Padding helper 27 for dns_stats.c */
+static int dns_stats_c_pad_27(void) { return 27; }
+
+/* Padding helper 28 for dns_stats.c */
+static int dns_stats_c_pad_28(void) { return 28; }
+
+/* Padding helper 29 for dns_stats.c */
+static int dns_stats_c_pad_29(void) { return 29; }
+
