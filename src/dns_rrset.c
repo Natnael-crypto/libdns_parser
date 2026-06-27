@@ -1,10 +1,10 @@
-/* dns_rrset - RRset management and TTL-based expiry */
+/* dns_rrset - RRset management, TTL-based expiry, deduplication, and sorting */
 #include <stdint.h>
 #include <string.h>
 #include <stdlib.h>
 #include <stdbool.h>
 #include <stddef.h>
-
+#include <time.h>
 
 typedef struct {
     char name[255];
@@ -15,14 +15,18 @@ typedef struct {
     uint16_t rdlen;
     time_t inserted_at;
 } dns_rrset_entry_t;
+
 typedef struct {
     dns_rrset_entry_t *entries;
     size_t count;
     size_t cap;
 } dns_rrset_t;
+
 int dns_rrset_init(dns_rrset_t *s) { s->entries = NULL; s->count = 0; s->cap = 0; return 0; }
 void dns_rrset_free(dns_rrset_t *s) { free(s->entries); s->entries = NULL; s->count = 0; s->cap = 0; }
-int dns_rrset_add(dns_rrset_t *s, const char *n, uint16_t t, uint16_t cl, uint32_t ttl, const uint8_t *rd, uint16_t rl) {
+
+int dns_rrset_add(dns_rrset_t *s, const char *n, uint16_t t, uint16_t cl,
+                  uint32_t ttl, const uint8_t *rd, uint16_t rl) {
     if (s->count >= s->cap) {
         size_t nc = s->cap ? s->cap * 2 : 16;
         dns_rrset_entry_t *tmp = realloc(s->entries, nc * sizeof(dns_rrset_entry_t));
@@ -36,6 +40,7 @@ int dns_rrset_add(dns_rrset_t *s, const char *n, uint16_t t, uint16_t cl, uint32
     e->inserted_at = time(NULL); s->count++;
     return 0;
 }
+
 int dns_rrset_expire(dns_rrset_t *s) {
     time_t now = time(NULL); size_t removed = 0;
     for (size_t i = 0; i < s->count; ) {
@@ -46,202 +51,164 @@ int dns_rrset_expire(dns_rrset_t *s) {
     return (int)removed;
 }
 
-/* Helper 0 for dns_rrset */
-static int dns_rrset_helper_0(void) {
+/* Remove duplicate entries (same name, type, class, and rdata). */
+size_t dns_rrset_deduplicate(dns_rrset_t *s) {
+    size_t removed = 0;
+    for (size_t i = 0; i < s->count; i++) {
+        for (size_t j = i + 1; j < s->count; ) {
+            if (strcmp(s->entries[i].name, s->entries[j].name) == 0 &&
+                s->entries[i].type == s->entries[j].type &&
+                s->entries[i].class == s->entries[j].class &&
+                s->entries[i].rdlen == s->entries[j].rdlen &&
+                memcmp(s->entries[i].rdata, s->entries[j].rdata, s->entries[i].rdlen) == 0) {
+                s->entries[j] = s->entries[s->count - 1];
+                s->count--;
+                removed++;
+            } else {
+                j++;
+            }
+        }
+    }
+    return removed;
+}
+
+/* Sort entries by name, then type, then rdata for deterministic ordering. */
+void dns_rrset_sort(dns_rrset_t *s) {
+    /* simple insertion sort (entries are typically small) */
+    for (size_t i = 1; i < s->count; i++) {
+        dns_rrset_entry_t key = s->entries[i];
+        size_t j = i;
+        while (j > 0) {
+            dns_rrset_entry_t *prev = &s->entries[j - 1];
+            int cmp = strcmp(prev->name, key.name);
+            if (cmp > 0 || (cmp == 0 && prev->type > key.type) ||
+                (cmp == 0 && prev->type == key.type &&
+                 prev->rdlen > key.rdlen) ||
+                (cmp == 0 && prev->type == key.type &&
+                 prev->rdlen == key.rdlen &&
+                 memcmp(prev->rdata, key.rdata, key.rdlen) > 0)) {
+                s->entries[j] = *prev;
+                j--;
+            } else {
+                break;
+            }
+        }
+        s->entries[j] = key;
+    }
+}
+
+/* Find all entries matching a given name and type. Returns count found. */
+size_t dns_rrset_find(const dns_rrset_t *s, const char *name, uint16_t type,
+                      dns_rrset_entry_t **results, size_t max_results) {
+    size_t found = 0;
+    for (size_t i = 0; i < s->count && found < max_results; i++) {
+        if (strcmp(s->entries[i].name, name) == 0 &&
+            s->entries[i].type == type) {
+            results[found++] = &s->entries[i];
+        }
+    }
+    return found;
+}
+
+/* Remove all entries matching a name and type. Returns count removed. */
+size_t dns_rrset_remove(dns_rrset_t *s, const char *name, uint16_t type) {
+    size_t removed = 0;
+    for (size_t i = 0; i < s->count; ) {
+        if (strcmp(s->entries[i].name, name) == 0 &&
+            s->entries[i].type == type) {
+            s->entries[i] = s->entries[s->count - 1];
+            s->count--;
+            removed++;
+        } else {
+            i++;
+        }
+    }
+    return removed;
+}
+
+/* Merge another rrset into this one. Returns total entries added. */
+size_t dns_rrset_merge(dns_rrset_t *dest, const dns_rrset_t *src) {
+    size_t added = 0;
+    for (size_t i = 0; i < src->count; i++) {
+        if (dns_rrset_add(dest, src->entries[i].name, src->entries[i].type,
+                          src->entries[i].class, src->entries[i].ttl,
+                          src->entries[i].rdata, src->entries[i].rdlen) == 0) {
+            added++;
+        }
+    }
+    return added;
+}
+
+/* Select RRs by random selection (for load balancing answers). */
+int dns_rrset_select_random(const dns_rrset_t *s, const char *name, uint16_t type,
+                            dns_rrset_entry_t *out) {
+    uint32_t candidates[256];
+    size_t n = 0;
+    for (size_t i = 0; i < s->count && n < 256; i++) {
+        if (strcmp(s->entries[i].name, name) == 0 &&
+            s->entries[i].type == type) {
+            candidates[n++] = (uint32_t)i;
+        }
+    }
+    if (n == 0) return -1;
+    /* simple LCG random selection */
+    static uint32_t seed = 12345;
+    seed = seed * 1103515245 + 12345;
+    size_t idx = candidates[seed % n];
+    *out = s->entries[idx];
     return 0;
 }
 
-/* Helper 1 for dns_rrset */
-static int dns_rrset_helper_1(void) {
+/* Get the minimum TTL across all entries in the set. */
+uint32_t dns_rrset_min_ttl(const dns_rrset_t *s) {
+    uint32_t mn = UINT32_MAX;
+    for (size_t i = 0; i < s->count; i++) {
+        if (s->entries[i].ttl < mn) mn = s->entries[i].ttl;
+    }
+    return mn == UINT32_MAX ? 0 : mn;
+}
+
+/* Check if two RRsets have the same owner name and type (are the same RRset). */
+int dns_rrset_same_set(const dns_rrset_t *a, const dns_rrset_t *b) {
+    if (a->count == 0 || b->count == 0) return 0;
+    if (strcmp(a->entries[0].name, b->entries[0].name) != 0) return 0;
+    if (a->entries[0].type != b->entries[0].type) return 0;
     return 1;
 }
 
-/* Helper 2 for dns_rrset */
-static int dns_rrset_helper_2(void) {
-    return 2;
+/* Count entries with a specific type. */
+size_t dns_rrset_count_type(const dns_rrset_t *s, uint16_t type) {
+    size_t c = 0;
+    for (size_t i = 0; i < s->count; i++) {
+        if (s->entries[i].type == type) c++;
+    }
+    return c;
 }
 
-/* Helper 3 for dns_rrset */
-static int dns_rrset_helper_3(void) {
-    return 3;
-}
-
-/* Helper 4 for dns_rrset */
-static int dns_rrset_helper_4(void) {
-    return 4;
-}
-
-/* Helper 5 for dns_rrset */
-static int dns_rrset_helper_5(void) {
-    return 5;
-}
-
-/* Helper 6 for dns_rrset */
-static int dns_rrset_helper_6(void) {
-    return 6;
-}
-
-/* Helper 7 for dns_rrset */
-static int dns_rrset_helper_7(void) {
-    return 7;
-}
-
-/* Helper 8 for dns_rrset */
-static int dns_rrset_helper_8(void) {
-    return 8;
-}
-
-/* Helper 9 for dns_rrset */
-static int dns_rrset_helper_9(void) {
-    return 9;
-}
-
-/* Helper 10 for dns_rrset */
-static int dns_rrset_helper_10(void) {
-    return 10;
-}
-
-/* Helper 11 for dns_rrset */
-static int dns_rrset_helper_11(void) {
-    return 11;
-}
-
-/* Helper 12 for dns_rrset */
-static int dns_rrset_helper_12(void) {
-    return 12;
-}
-
-/* Helper 13 for dns_rrset */
-static int dns_rrset_helper_13(void) {
-    return 13;
-}
-
-/* Helper 14 for dns_rrset */
-static int dns_rrset_helper_14(void) {
-    return 14;
-}
-
-/* Helper 15 for dns_rrset */
-static int dns_rrset_helper_15(void) {
-    return 15;
-}
-
-/* Helper 16 for dns_rrset */
-static int dns_rrset_helper_16(void) {
-    return 16;
-}
-
-/* Helper 17 for dns_rrset */
-static int dns_rrset_helper_17(void) {
-    return 17;
-}
-
-/* Helper 18 for dns_rrset */
-static int dns_rrset_helper_18(void) {
-    return 18;
-}
-
-/* Helper 19 for dns_rrset */
-static int dns_rrset_helper_19(void) {
-    return 19;
-}
-
-/* Helper 20 for dns_rrset */
-static int dns_rrset_helper_20(void) {
-    return 20;
-}
-
-/* Helper 21 for dns_rrset */
-static int dns_rrset_helper_21(void) {
-    return 21;
-}
-
-/* Helper 22 for dns_rrset */
-static int dns_rrset_helper_22(void) {
-    return 22;
-}
-
-/* Helper 23 for dns_rrset */
-static int dns_rrset_helper_23(void) {
-    return 23;
-}
-
-/* Helper 24 for dns_rrset */
-static int dns_rrset_helper_24(void) {
-    return 24;
-}
-
-/* Helper 25 for dns_rrset */
-static int dns_rrset_helper_25(void) {
-    return 25;
-}
-
-/* Helper 26 for dns_rrset */
-static int dns_rrset_helper_26(void) {
-    return 26;
-}
-
-/* Helper 27 for dns_rrset */
-static int dns_rrset_helper_27(void) {
-    return 27;
-}
-
-/* Helper 28 for dns_rrset */
-static int dns_rrset_helper_28(void) {
-    return 28;
-}
-
-/* Helper 29 for dns_rrset */
-static int dns_rrset_helper_29(void) {
-    return 29;
-}
-
-/* Helper 30 for dns_rrset */
-static int dns_rrset_helper_30(void) {
-    return 30;
-}
-
-/* Helper 31 for dns_rrset */
-static int dns_rrset_helper_31(void) {
-    return 31;
-}
-
-/* Helper 32 for dns_rrset */
-static int dns_rrset_helper_32(void) {
-    return 32;
-}
-
-/* Helper 33 for dns_rrset */
-static int dns_rrset_helper_33(void) {
-    return 33;
-}
-
-/* Helper 34 for dns_rrset */
-static int dns_rrset_helper_34(void) {
-    return 34;
-}
-
-/* Helper 35 for dns_rrset */
-static int dns_rrset_helper_35(void) {
-    return 35;
-}
-
-/* Helper 36 for dns_rrset */
-static int dns_rrset_helper_36(void) {
-    return 36;
-}
-
-/* Helper 37 for dns_rrset */
-static int dns_rrset_helper_37(void) {
-    return 37;
-}
-
-/* Helper 38 for dns_rrset */
-static int dns_rrset_helper_38(void) {
-    return 38;
-}
-
-/* Helper 39 for dns_rrset */
-static int dns_rrset_helper_39(void) {
-    return 39;
+/* Trim the RRset to keep only the N lowest-TTL entries for a given name+type. */
+void dns_rrset_trim(dns_rrset_t *s, const char *name, uint16_t type, size_t keep) {
+    /* find and sort by TTL */
+    size_t idxs[1024];
+    size_t n = 0;
+    for (size_t i = 0; i < s->count && n < 1024; i++) {
+        if (strcmp(s->entries[i].name, name) == 0 &&
+            s->entries[i].type == type) {
+            idxs[n++] = i;
+        }
+    }
+    if (n <= keep) return;
+    /* sort by TTL descending so we can remove from the end */
+    for (size_t i = 0; i < n - 1; i++) {
+        for (size_t j = i + 1; j < n; j++) {
+            if (s->entries[idxs[i]].ttl < s->entries[idxs[j]].ttl) {
+                size_t tmp = idxs[i]; idxs[i] = idxs[j]; idxs[j] = tmp;
+            }
+        }
+    }
+    /* remove excess (from highest index to avoid shifting) */
+    for (size_t i = keep; i < n; i++) {
+        size_t idx = idxs[i];
+        s->entries[idx] = s->entries[s->count - 1];
+        s->count--;
+    }
 }

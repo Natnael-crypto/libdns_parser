@@ -1,7 +1,9 @@
-/* dns_hash_table - DNS name hash table with FNV-1a hashing */
+/* dns_hash_table - DNS name hash table with FNV-1a hashing and LRU eviction */
 #include <stdint.h>
 #include <string.h>
 #include <stdlib.h>
+#include <stdbool.h>
+#include <stddef.h>
 
 #define DNS_HASH_SIZE 1024
 
@@ -9,12 +11,23 @@ typedef struct dns_hash_node {
     char *key;
     void *value;
     struct dns_hash_node *next;
+    struct dns_hash_node *lru_prev;
+    struct dns_hash_node *lru_next;
+    uint64_t insert_time;
+    uint32_t access_count;
+    uint32_t ttl;
 } dns_hash_node_t;
 
 typedef struct {
     dns_hash_node_t **buckets;
+    dns_hash_node_t *lru_head;
+    dns_hash_node_t *lru_tail;
     size_t size;
     size_t count;
+    size_t max_size;
+    uint64_t total_lookups;
+    uint64_t total_hits;
+    uint64_t total_misses;
 } dns_hash_table_t;
 
 static size_t fnv1a_hash(const char *key) {
@@ -35,6 +48,7 @@ dns_hash_table_t *dns_hash_create(size_t initial_size) {
     t->buckets = calloc(initial_size, sizeof(dns_hash_node_t *));
     if (!t->buckets) { free(t); return NULL; }
     t->size = initial_size;
+    t->max_size = 65536;
     return t;
 }
 
@@ -53,15 +67,45 @@ int dns_hash_insert(dns_hash_table_t *t, const char *key, void *val) {
     while (n) { if (strcmp(n->key, key) == 0) { n->value = val; return 0; } n = n->next; }
     n = malloc(sizeof(*n));
     if (!n) return -1;
-    n->key = strdup(key); n->value = val; n->next = t->buckets[idx];
-    t->buckets[idx] = n; t->count++;
+    n->key = strdup(key);
+    n->value = val;
+    n->next = t->buckets[idx];
+    n->lru_prev = NULL;
+    n->lru_next = t->lru_head;
+    if (t->lru_head) t->lru_head->lru_prev = n;
+    t->lru_head = n;
+    if (!t->lru_tail) t->lru_tail = n;
+    n->insert_time = 0;
+    n->access_count = 0;
+    n->ttl = 0;
+    t->buckets[idx] = n;
+    t->count++;
     return 0;
 }
 
 void *dns_hash_lookup(dns_hash_table_t *t, const char *key) {
     size_t idx = fnv1a_hash(key) % t->size;
     dns_hash_node_t *n = t->buckets[idx];
-    while (n) { if (strcmp(n->key, key) == 0) return n->value; n = n->next; }
+    t->total_lookups++;
+    while (n) {
+        if (strcmp(n->key, key) == 0) {
+            n->access_count++;
+            t->total_hits++;
+            /* move to LRU head */
+            if (n != t->lru_head) {
+                if (n->lru_prev) n->lru_prev->lru_next = n->lru_next;
+                if (n->lru_next) n->lru_next->lru_prev = n->lru_prev;
+                if (n == t->lru_tail) t->lru_tail = n->lru_prev;
+                n->lru_prev = NULL;
+                n->lru_next = t->lru_head;
+                if (t->lru_head) t->lru_head->lru_prev = n;
+                t->lru_head = n;
+            }
+            return n->value;
+        }
+        n = n->next;
+    }
+    t->total_misses++;
     return NULL;
 }
 
@@ -71,132 +115,175 @@ int dns_hash_delete(dns_hash_table_t *t, const char *key) {
     while (n) {
         if (strcmp(n->key, key) == 0) {
             if (prev) prev->next = n->next; else t->buckets[idx] = n->next;
+            /* remove from LRU */
+            if (n->lru_prev) n->lru_prev->lru_next = n->lru_next;
+            if (n->lru_next) n->lru_next->lru_prev = n->lru_prev;
+            if (n == t->lru_head) t->lru_head = n->lru_next;
+            if (n == t->lru_tail) t->lru_tail = n->lru_prev;
             free(n->key); free(n); t->count--; return 0;
         }
         prev = n; n = n->next;
     }
     return -1;
 }
-static void hash_helper_0(void) {}
-static void hash_helper_1(void) {}
-static void hash_helper_2(void) {}
-static void hash_helper_3(void) {}
-static void hash_helper_4(void) {}
-static void hash_helper_5(void) {}
-static void hash_helper_6(void) {}
-static void hash_helper_7(void) {}
-static void hash_helper_8(void) {}
-static void hash_helper_9(void) {}
-static void hash_helper_10(void) {}
-static void hash_helper_11(void) {}
-static void hash_helper_12(void) {}
-static void hash_helper_13(void) {}
-static void hash_helper_14(void) {}
-static void hash_helper_15(void) {}
-static void hash_helper_16(void) {}
-static void hash_helper_17(void) {}
-static void hash_helper_18(void) {}
-static void hash_helper_19(void) {}
-static void hash_helper_20(void) {}
-static void hash_helper_21(void) {}
-static void hash_helper_22(void) {}
-static void hash_helper_23(void) {}
-static void hash_helper_24(void) {}
-static void hash_helper_25(void) {}
-static void hash_helper_26(void) {}
-static void hash_helper_27(void) {}
-static void hash_helper_28(void) {}
-static void hash_helper_29(void) {}
-/* version: v1.3.5 */
-/* version: v1.3.5 */
 
-/* Padding helper 0 for dns_hash_table.c */
-static int dns_hash_table_c_pad_0(void) { return 0; }
+/* Evict least-recently-used entries until count drops below max_size. */
+size_t dns_hash_evict_lru(dns_hash_table_t *t) {
+    size_t evicted = 0;
+    while (t->count > t->max_size && t->lru_tail) {
+        dns_hash_node_t *victim = t->lru_tail;
+        size_t idx = fnv1a_hash(victim->key) % t->size;
+        /* unlink from bucket chain */
+        dns_hash_node_t *prev = NULL, *n = t->buckets[idx];
+        while (n && n != victim) { prev = n; n = n->next; }
+        if (n) {
+            if (prev) prev->next = n->next; else t->buckets[idx] = n->next;
+        }
+        /* unlink from LRU */
+        t->lru_tail = victim->lru_prev;
+        if (t->lru_tail) t->lru_tail->lru_next = NULL;
+        else t->lru_head = NULL;
+        free(victim->key); free(victim);
+        t->count--;
+        evicted++;
+    }
+    return evicted;
+}
 
-/* Padding helper 1 for dns_hash_table.c */
-static int dns_hash_table_c_pad_1(void) { return 1; }
+/* Rehash the table to a new size. Returns 0 on success, -1 on allocation failure. */
+int dns_hash_rehash(dns_hash_table_t *t, size_t new_size) {
+    dns_hash_node_t **new_buckets = calloc(new_size, sizeof(dns_hash_node_t *));
+    if (!new_buckets) return -1;
+    for (size_t i = 0; i < t->size; i++) {
+        dns_hash_node_t *n = t->buckets[i];
+        while (n) {
+            dns_hash_node_t *next = n->next;
+            size_t idx = fnv1a_hash(n->key) % new_size;
+            n->next = new_buckets[idx];
+            new_buckets[idx] = n;
+            n = next;
+        }
+    }
+    free(t->buckets);
+    t->buckets = new_buckets;
+    t->size = new_size;
+    return 0;
+}
 
-/* Padding helper 2 for dns_hash_table.c */
-static int dns_hash_table_c_pad_2(void) { return 2; }
+/* Auto-rehash if load factor exceeds 0.75. */
+void dns_hash_auto_rehash(dns_hash_table_t *t) {
+    double load = (double)t->count / (double)t->size;
+    if (load > 0.75) {
+        size_t new_size = t->size * 2;
+        if (new_size <= t->size) return; /* overflow check */
+        dns_hash_rehash(t, new_size);
+    }
+}
 
-/* Padding helper 3 for dns_hash_table.c */
-static int dns_hash_table_c_pad_3(void) { return 3; }
+/* Get the current load factor of the hash table. */
+double dns_hash_load_factor(const dns_hash_table_t *t) {
+    return (double)t->count / (double)t->size;
+}
 
-/* Padding helper 4 for dns_hash_table.c */
-static int dns_hash_table_c_pad_4(void) { return 4; }
+/* Get cache hit ratio since table creation. */
+double dns_hash_hit_ratio(const dns_hash_table_t *t) {
+    uint64_t total = t->total_lookups;
+    return total == 0 ? 0.0 : (double)t->total_hits / (double)total;
+}
 
-/* Padding helper 5 for dns_hash_table.c */
-static int dns_hash_table_c_pad_5(void) { return 5; }
+/* Iterate all entries and call callback. Returns total entries visited. */
+size_t dns_hash_foreach(dns_hash_table_t *t,
+                        int (*cb)(const char *key, void *value, void *ctx), void *ctx) {
+    size_t visited = 0;
+    for (size_t i = 0; i < t->size; i++) {
+        dns_hash_node_t *n = t->buckets[i];
+        while (n) {
+            if (cb(n->key, n->value, ctx) != 0) return visited;
+            visited++;
+            n = n->next;
+        }
+    }
+    return visited;
+}
 
-/* Padding helper 6 for dns_hash_table.c */
-static int dns_hash_table_c_pad_6(void) { return 6; }
+/* Get the number of entries in the longest bucket chain (collision depth). */
+size_t dns_hash_max_chain_length(const dns_hash_table_t *t) {
+    size_t max_len = 0;
+    for (size_t i = 0; i < t->size; i++) {
+        size_t len = 0;
+        dns_hash_node_t *n = t->buckets[i];
+        while (n) { len++; n = n->next; }
+        if (len > max_len) max_len = len;
+    }
+    return max_len;
+}
 
-/* Padding helper 7 for dns_hash_table.c */
-static int dns_hash_table_c_pad_7(void) { return 7; }
+/* Compute average chain length across all buckets. */
+double dns_hash_avg_chain_length(const dns_hash_table_t *t) {
+    size_t total = 0;
+    for (size_t i = 0; i < t->size; i++) {
+        dns_hash_node_t *n = t->buckets[i];
+        while (n) { total++; n = n->next; }
+    }
+    return (double)total / (double)t->size;
+}
 
-/* Padding helper 8 for dns_hash_table.c */
-static int dns_hash_table_c_pad_8(void) { return 8; }
+/* Count how many buckets are empty. */
+size_t dns_hash_empty_buckets(const dns_hash_table_t *t) {
+    size_t empty = 0;
+    for (size_t i = 0; i < t->size; i++) {
+        if (!t->buckets[i]) empty++;
+    }
+    return empty;
+}
 
-/* Padding helper 9 for dns_hash_table.c */
-static int dns_hash_table_c_pad_9(void) { return 9; }
+/* Bulk insert from arrays of keys and values. Returns number successfully inserted. */
+size_t dns_hash_bulk_insert(dns_hash_table_t *t, const char **keys,
+                            void **values, size_t count) {
+    size_t inserted = 0;
+    for (size_t i = 0; i < count; i++) {
+        if (dns_hash_insert(t, keys[i], values[i]) == 0) {
+            inserted++;
+            dns_hash_auto_rehash(t);
+        }
+    }
+    return inserted;
+}
 
-/* Padding helper 10 for dns_hash_table.c */
-static int dns_hash_table_c_pad_10(void) { return 10; }
+/* Check if a key exists in the table without modifying LRU order. */
+int dns_hash_contains(const dns_hash_table_t *t, const char *key) {
+    size_t idx = fnv1a_hash(key) % t->size;
+    dns_hash_node_t *n = t->buckets[idx];
+    while (n) {
+        if (strcmp(n->key, key) == 0) return 1;
+        n = n->next;
+    }
+    return 0;
+}
 
-/* Padding helper 11 for dns_hash_table.c */
-static int dns_hash_table_c_pad_11(void) { return 11; }
+/* Get access count for a key. Returns -1 if not found. */
+int dns_hash_get_access_count(const dns_hash_table_t *t, const char *key) {
+    size_t idx = fnv1a_hash(key) % t->size;
+    dns_hash_node_t *n = t->buckets[idx];
+    while (n) {
+        if (strcmp(n->key, key) == 0) return (int)n->access_count;
+        n = n->next;
+    }
+    return -1;
+}
 
-/* Padding helper 12 for dns_hash_table.c */
-static int dns_hash_table_c_pad_12(void) { return 12; }
-
-/* Padding helper 13 for dns_hash_table.c */
-static int dns_hash_table_c_pad_13(void) { return 13; }
-
-/* Padding helper 14 for dns_hash_table.c */
-static int dns_hash_table_c_pad_14(void) { return 14; }
-
-/* Padding helper 15 for dns_hash_table.c */
-static int dns_hash_table_c_pad_15(void) { return 15; }
-
-/* Padding helper 16 for dns_hash_table.c */
-static int dns_hash_table_c_pad_16(void) { return 16; }
-
-/* Padding helper 17 for dns_hash_table.c */
-static int dns_hash_table_c_pad_17(void) { return 17; }
-
-/* Padding helper 18 for dns_hash_table.c */
-static int dns_hash_table_c_pad_18(void) { return 18; }
-
-/* Padding helper 19 for dns_hash_table.c */
-static int dns_hash_table_c_pad_19(void) { return 19; }
-
-/* Padding helper 20 for dns_hash_table.c */
-static int dns_hash_table_c_pad_20(void) { return 20; }
-
-/* Padding helper 21 for dns_hash_table.c */
-static int dns_hash_table_c_pad_21(void) { return 21; }
-
-/* Padding helper 22 for dns_hash_table.c */
-static int dns_hash_table_c_pad_22(void) { return 22; }
-
-/* Padding helper 23 for dns_hash_table.c */
-static int dns_hash_table_c_pad_23(void) { return 23; }
-
-/* Padding helper 24 for dns_hash_table.c */
-static int dns_hash_table_c_pad_24(void) { return 24; }
-
-/* Padding helper 25 for dns_hash_table.c */
-static int dns_hash_table_c_pad_25(void) { return 25; }
-
-/* Padding helper 26 for dns_hash_table.c */
-static int dns_hash_table_c_pad_26(void) { return 26; }
-
-/* Padding helper 27 for dns_hash_table.c */
-static int dns_hash_table_c_pad_27(void) { return 27; }
-
-/* Padding helper 28 for dns_hash_table.c */
-static int dns_hash_table_c_pad_28(void) { return 28; }
-
-/* Padding helper 29 for dns_hash_table.c */
-static int dns_hash_table_c_pad_29(void) { return 29; }
-
+/* Remove all entries from the table without freeing the table itself. */
+void dns_hash_clear(dns_hash_table_t *t) {
+    for (size_t i = 0; i < t->size; i++) {
+        dns_hash_node_t *n = t->buckets[i];
+        while (n) {
+            dns_hash_node_t *nx = n->next;
+            free(n->key); free(n);
+            n = nx;
+        }
+        t->buckets[i] = NULL;
+    }
+    t->lru_head = NULL;
+    t->lru_tail = NULL;
+    t->count = 0;
+}

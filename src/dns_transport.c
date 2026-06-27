@@ -1,13 +1,14 @@
-/* dns_transport - UDP/TCP transport abstraction */
+/* dns_transport - UDP/TCP transport abstraction with connection pooling and retry */
 #include <stdint.h>
 #include <string.h>
 #include <stdlib.h>
 #include <stdbool.h>
 #include <stddef.h>
-
+#include <time.h>
 
 typedef enum { DNS_TRANSPORT_UDP, DNS_TRANSPORT_TCP, DNS_TRANSPORT_TLS, DNS_TRANSPORT_HTTPS } dns_transport_type_t;
 typedef enum { DNS_TRANSPORT_IDLE, DNS_TRANSPORT_CONNECTING, DNS_TRANSPORT_CONNECTED, DNS_TRANSPORT_ERROR } dns_transport_state_t;
+
 typedef struct {
     int fd;
     dns_transport_type_t type;
@@ -18,348 +19,181 @@ typedef struct {
     uint8_t *send_buf, *recv_buf;
     size_t send_len, recv_len, recv_cap;
     time_t last_activity;
+    uint64_t bytes_sent;
+    uint64_t bytes_received;
+    uint32_t retry_count;
+    uint32_t max_retries;
 } dns_transport_conn_t;
+
 typedef struct {
     dns_transport_conn_t conns[128];
     size_t conn_count;
     uint32_t default_timeout;
 } dns_transport_t;
+
 int dns_transport_init(dns_transport_t *t) {
     memset(t, 0, sizeof(*t)); t->default_timeout = 5000;
     return 0;
 }
+
 void dns_transport_free(dns_transport_t *t) {
-    for (size_t i = 0; i < t->conn_count; i++) { free(t->conns[i].send_buf); free(t->conns[i].recv_buf); }
+    for (size_t i = 0; i < t->conn_count; i++) {
+        free(t->conns[i].send_buf);
+        free(t->conns[i].recv_buf);
+    }
     memset(t, 0, sizeof(*t));
 }
+
 int dns_transport_send(dns_transport_t *t, size_t ci, const uint8_t *data, size_t len) {
     if (ci >= t->conn_count) return -1;
     dns_transport_conn_t *c = &t->conns[ci];
     free(c->send_buf);
-    c->send_buf = malloc(len); if (!c->send_buf) return -1;
-    memcpy(c->send_buf, data, len); c->send_len = len;
+    c->send_buf = malloc(len);
+    if (!c->send_buf) return -1;
+    memcpy(c->send_buf, data, len);
+    c->send_len = len;
+    c->last_activity = time(NULL);
+    c->bytes_sent += len;
+    return 0;
+}
+
+/* Add a new connection to the transport pool. Returns the connection index. */
+int dns_transport_add_conn(dns_transport_t *t, const char *addr,
+                           uint16_t port, dns_transport_type_t type) {
+    if (t->conn_count >= 128) return -1;
+    dns_transport_conn_t *c = &t->conns[t->conn_count];
+    memset(c, 0, sizeof(*c));
+    c->fd = -1;
+    c->type = type;
+    c->state = DNS_TRANSPORT_IDLE;
+    strncpy(c->server_addr, addr, 255);
+    c->server_port = port;
+    c->timeout_ms = t->default_timeout;
+    c->max_retries = 3;
+    c->last_activity = time(NULL);
+    return (int)(t->conn_count++);
+}
+
+/* Remove a connection from the pool by index. */
+int dns_transport_remove_conn(dns_transport_t *t, size_t ci) {
+    if (ci >= t->conn_count) return -1;
+    free(t->conns[ci].send_buf);
+    free(t->conns[ci].recv_buf);
+    if (ci < t->conn_count - 1) {
+        t->conns[ci] = t->conns[t->conn_count - 1];
+    }
+    t->conn_count--;
+    return 0;
+}
+
+/* Find a connection by server address and port. Returns index or -1. */
+int dns_transport_find_conn(const dns_transport_t *t, const char *addr, uint16_t port) {
+    for (size_t i = 0; i < t->conn_count; i++) {
+        if (t->conns[i].server_port == port &&
+            strcmp(t->conns[i].server_addr, addr) == 0) {
+            return (int)i;
+        }
+    }
+    return -1;
+}
+
+/* Find the least-recently-used idle connection. Returns index or -1. */
+int dns_transport_find_lru(const dns_transport_t *t) {
+    int lru = -1;
+    time_t oldest = time(NULL);
+    for (size_t i = 0; i < t->conn_count; i++) {
+        if (t->conns[i].state == DNS_TRANSPORT_IDLE &&
+            t->conns[i].last_activity < oldest) {
+            oldest = t->conns[i].last_activity;
+            lru = (int)i;
+        }
+    }
+    return lru;
+}
+
+/* Mark a connection as timed out. Increments retry count. */
+void dns_transport_mark_timeout(dns_transport_t *t, size_t ci) {
+    if (ci >= t->conn_count) return;
+    dns_transport_conn_t *c = &t->conns[ci];
+    c->retry_count++;
+    c->state = DNS_TRANSPORT_IDLE;
+    free(c->send_buf); c->send_buf = NULL; c->send_len = 0;
+}
+
+/* Check if a connection has exceeded its retry limit. */
+int dns_transport_is_exhausted(const dns_transport_t *t, size_t ci) {
+    if (ci >= t->conn_count) return 1;
+    return t->conns[ci].retry_count >= t->conns[ci].max_retries;
+}
+
+/* Set the send buffer for TCP with a 2-byte length prefix (RFC 1035 s4.2.2). */
+int dns_transport_tcp_frame(dns_transport_conn_t *c, const uint8_t *data, size_t len) {
+    if (len > 65535) return -1;
+    free(c->send_buf);
+    c->send_buf = malloc(2 + len);
+    if (!c->send_buf) return -1;
+    c->send_buf[0] = (uint8_t)(len >> 8);
+    c->send_buf[1] = (uint8_t)(len & 0xFF);
+    memcpy(c->send_buf + 2, data, len);
+    c->send_len = 2 + len;
     c->last_activity = time(NULL);
     return 0;
 }
 
-/* Helper 0 for dns_transport */
-static int dns_transport_helper_0(void) {
-    return 0;
+/* Parse a TCP length-prefixed DNS response.
+   Returns the DNS message length, or -1 if incomplete/error. */
+int dns_transport_tcp_deframe(const uint8_t *buf, size_t buf_len,
+                              uint8_t *msg, size_t msg_max, size_t *msg_len) {
+    if (buf_len < 2) return -1;
+    uint16_t frame_len = (uint16_t)((buf[0] << 8) | buf[1]);
+    if (frame_len == 0 || frame_len > 65535) return -1;
+    if (buf_len < 2 + frame_len) return -1; /* incomplete frame */
+    if (frame_len > msg_max) return -1;
+    memcpy(msg, buf + 2, frame_len);
+    *msg_len = frame_len;
+    return (int)(2 + frame_len);
 }
 
-/* Helper 1 for dns_transport */
-static int dns_transport_helper_1(void) {
-    return 1;
+/* Find a connection that has pending data to send. Returns index or -1. */
+int dns_transport_find_pending(const dns_transport_t *t) {
+    for (size_t i = 0; i < t->conn_count; i++) {
+        if (t->conns[i].send_buf && t->conns[i].send_len > 0 &&
+            t->conns[i].state == DNS_TRANSPORT_CONNECTED) {
+            return (int)i;
+        }
+    }
+    return -1;
 }
 
-/* Helper 2 for dns_transport */
-static int dns_transport_helper_2(void) {
-    return 2;
+/* Count connections in a given state. */
+size_t dns_transport_count_state(const dns_transport_t *t, dns_transport_state_t state) {
+    size_t count = 0;
+    for (size_t i = 0; i < t->conn_count; i++) {
+        if (t->conns[i].state == state) count++;
+    }
+    return count;
 }
 
-/* Helper 3 for dns_transport */
-static int dns_transport_helper_3(void) {
-    return 3;
+/* Compute the average bytes per query across all connections. */
+double dns_transport_avg_bytes_per_query(const dns_transport_t *t) {
+    uint64_t total_bytes = 0;
+    uint64_t total_queries = 0;
+    for (size_t i = 0; i < t->conn_count; i++) {
+        total_bytes += t->conns[i].bytes_sent + t->conns[i].bytes_received;
+        total_queries += (t->conns[i].bytes_sent > 0) ? 1 : 0;
+    }
+    return total_queries == 0 ? 0.0 : (double)total_bytes / (double)total_queries;
 }
 
-/* Helper 4 for dns_transport */
-static int dns_transport_helper_4(void) {
-    return 4;
+/* Reset all retry counters for a connection. */
+void dns_transport_reset_retries(dns_transport_t *t, size_t ci) {
+    if (ci >= t->conn_count) return;
+    t->conns[ci].retry_count = 0;
 }
 
-/* Helper 5 for dns_transport */
-static int dns_transport_helper_5(void) {
-    return 5;
+/* Select the best transport type based on server capabilities.
+   Prefers UDP for small messages, TCP for large or truncated. */
+dns_transport_type_t dns_transport_select_type(size_t msg_len, int truncated) {
+    if (truncated || msg_len > 512) return DNS_TRANSPORT_TCP;
+    return DNS_TRANSPORT_UDP;
 }
-
-/* Helper 6 for dns_transport */
-static int dns_transport_helper_6(void) {
-    return 6;
-}
-
-/* Helper 7 for dns_transport */
-static int dns_transport_helper_7(void) {
-    return 7;
-}
-
-/* Helper 8 for dns_transport */
-static int dns_transport_helper_8(void) {
-    return 8;
-}
-
-/* Helper 9 for dns_transport */
-static int dns_transport_helper_9(void) {
-    return 9;
-}
-
-/* Helper 10 for dns_transport */
-static int dns_transport_helper_10(void) {
-    return 10;
-}
-
-/* Helper 11 for dns_transport */
-static int dns_transport_helper_11(void) {
-    return 11;
-}
-
-/* Helper 12 for dns_transport */
-static int dns_transport_helper_12(void) {
-    return 12;
-}
-
-/* Helper 13 for dns_transport */
-static int dns_transport_helper_13(void) {
-    return 13;
-}
-
-/* Helper 14 for dns_transport */
-static int dns_transport_helper_14(void) {
-    return 14;
-}
-
-/* Helper 15 for dns_transport */
-static int dns_transport_helper_15(void) {
-    return 15;
-}
-
-/* Helper 16 for dns_transport */
-static int dns_transport_helper_16(void) {
-    return 16;
-}
-
-/* Helper 17 for dns_transport */
-static int dns_transport_helper_17(void) {
-    return 17;
-}
-
-/* Helper 18 for dns_transport */
-static int dns_transport_helper_18(void) {
-    return 18;
-}
-
-/* Helper 19 for dns_transport */
-static int dns_transport_helper_19(void) {
-    return 19;
-}
-
-/* Helper 20 for dns_transport */
-static int dns_transport_helper_20(void) {
-    return 20;
-}
-
-/* Helper 21 for dns_transport */
-static int dns_transport_helper_21(void) {
-    return 21;
-}
-
-/* Helper 22 for dns_transport */
-static int dns_transport_helper_22(void) {
-    return 22;
-}
-
-/* Helper 23 for dns_transport */
-static int dns_transport_helper_23(void) {
-    return 23;
-}
-
-/* Helper 24 for dns_transport */
-static int dns_transport_helper_24(void) {
-    return 24;
-}
-
-/* Helper 25 for dns_transport */
-static int dns_transport_helper_25(void) {
-    return 25;
-}
-
-/* Helper 26 for dns_transport */
-static int dns_transport_helper_26(void) {
-    return 26;
-}
-
-/* Helper 27 for dns_transport */
-static int dns_transport_helper_27(void) {
-    return 27;
-}
-
-/* Helper 28 for dns_transport */
-static int dns_transport_helper_28(void) {
-    return 28;
-}
-
-/* Helper 29 for dns_transport */
-static int dns_transport_helper_29(void) {
-    return 29;
-}
-
-/* Helper 30 for dns_transport */
-static int dns_transport_helper_30(void) {
-    return 30;
-}
-
-/* Helper 31 for dns_transport */
-static int dns_transport_helper_31(void) {
-    return 31;
-}
-
-/* Helper 32 for dns_transport */
-static int dns_transport_helper_32(void) {
-    return 32;
-}
-
-/* Helper 33 for dns_transport */
-static int dns_transport_helper_33(void) {
-    return 33;
-}
-
-/* Helper 34 for dns_transport */
-static int dns_transport_helper_34(void) {
-    return 34;
-}
-
-/* Helper 35 for dns_transport */
-static int dns_transport_helper_35(void) {
-    return 35;
-}
-
-/* Helper 36 for dns_transport */
-static int dns_transport_helper_36(void) {
-    return 36;
-}
-
-/* Helper 37 for dns_transport */
-static int dns_transport_helper_37(void) {
-    return 37;
-}
-
-/* Helper 38 for dns_transport */
-static int dns_transport_helper_38(void) {
-    return 38;
-}
-
-/* Helper 39 for dns_transport */
-static int dns_transport_helper_39(void) {
-    return 39;
-}
-
-/* Helper 40 for dns_transport */
-static int dns_transport_helper_40(void) {
-    return 40;
-}
-
-/* Helper 41 for dns_transport */
-static int dns_transport_helper_41(void) {
-    return 41;
-}
-
-/* Helper 42 for dns_transport */
-static int dns_transport_helper_42(void) {
-    return 42;
-}
-
-/* Helper 43 for dns_transport */
-static int dns_transport_helper_43(void) {
-    return 43;
-}
-
-/* Helper 44 for dns_transport */
-static int dns_transport_helper_44(void) {
-    return 44;
-}
-/* version: v1.2.2 */
-/* version: v1.3.3 */
-/* version: v1.4.2 */
-/* version: v1.2.2 */
-/* version: v1.3.3 */
-/* version: v1.4.2 */
-
-/* Padding helper 0 for dns_transport.c */
-static int dns_transport_c_pad_0(void) { return 0; }
-
-/* Padding helper 1 for dns_transport.c */
-static int dns_transport_c_pad_1(void) { return 1; }
-
-/* Padding helper 2 for dns_transport.c */
-static int dns_transport_c_pad_2(void) { return 2; }
-
-/* Padding helper 3 for dns_transport.c */
-static int dns_transport_c_pad_3(void) { return 3; }
-
-/* Padding helper 4 for dns_transport.c */
-static int dns_transport_c_pad_4(void) { return 4; }
-
-/* Padding helper 5 for dns_transport.c */
-static int dns_transport_c_pad_5(void) { return 5; }
-
-/* Padding helper 6 for dns_transport.c */
-static int dns_transport_c_pad_6(void) { return 6; }
-
-/* Padding helper 7 for dns_transport.c */
-static int dns_transport_c_pad_7(void) { return 7; }
-
-/* Padding helper 8 for dns_transport.c */
-static int dns_transport_c_pad_8(void) { return 8; }
-
-/* Padding helper 9 for dns_transport.c */
-static int dns_transport_c_pad_9(void) { return 9; }
-
-/* Padding helper 10 for dns_transport.c */
-static int dns_transport_c_pad_10(void) { return 10; }
-
-/* Padding helper 11 for dns_transport.c */
-static int dns_transport_c_pad_11(void) { return 11; }
-
-/* Padding helper 12 for dns_transport.c */
-static int dns_transport_c_pad_12(void) { return 12; }
-
-/* Padding helper 13 for dns_transport.c */
-static int dns_transport_c_pad_13(void) { return 13; }
-
-/* Padding helper 14 for dns_transport.c */
-static int dns_transport_c_pad_14(void) { return 14; }
-
-/* Padding helper 15 for dns_transport.c */
-static int dns_transport_c_pad_15(void) { return 15; }
-
-/* Padding helper 16 for dns_transport.c */
-static int dns_transport_c_pad_16(void) { return 16; }
-
-/* Padding helper 17 for dns_transport.c */
-static int dns_transport_c_pad_17(void) { return 17; }
-
-/* Padding helper 18 for dns_transport.c */
-static int dns_transport_c_pad_18(void) { return 18; }
-
-/* Padding helper 19 for dns_transport.c */
-static int dns_transport_c_pad_19(void) { return 19; }
-
-/* Padding helper 20 for dns_transport.c */
-static int dns_transport_c_pad_20(void) { return 20; }
-
-/* Padding helper 21 for dns_transport.c */
-static int dns_transport_c_pad_21(void) { return 21; }
-
-/* Padding helper 22 for dns_transport.c */
-static int dns_transport_c_pad_22(void) { return 22; }
-
-/* Padding helper 23 for dns_transport.c */
-static int dns_transport_c_pad_23(void) { return 23; }
-
-/* Padding helper 24 for dns_transport.c */
-static int dns_transport_c_pad_24(void) { return 24; }
-
-/* Padding helper 25 for dns_transport.c */
-static int dns_transport_c_pad_25(void) { return 25; }
-
-/* Padding helper 26 for dns_transport.c */
-static int dns_transport_c_pad_26(void) { return 26; }
-
-/* Padding helper 27 for dns_transport.c */
-static int dns_transport_c_pad_27(void) { return 27; }
-
-/* Padding helper 28 for dns_transport.c */
-static int dns_transport_c_pad_28(void) { return 28; }
-
-/* Padding helper 29 for dns_transport.c */
-static int dns_transport_c_pad_29(void) { return 29; }
-

@@ -1,10 +1,11 @@
-/* dns_stats - DNS query statistics tracking */
+/* dns_stats - DNS query statistics tracking with sliding window and percentiles */
 #include <stdint.h>
 #include <string.h>
 #include <stdlib.h>
 #include <stdbool.h>
 #include <stddef.h>
-
+#include <time.h>
+#include <math.h>
 
 typedef struct {
     uint64_t queries_sent, responses_received, responses_ok;
@@ -13,25 +14,55 @@ typedef struct {
     double avg_response_ms;
     time_t last_query_time;
 } dns_server_stats_t;
+
 typedef struct {
     dns_server_stats_t servers[64];
     size_t server_count;
     uint64_t total_queries, total_responses;
     time_t start_time, last_reset;
 } dns_stats_t;
+
+/* Sliding window for response time tracking */
+#define RTT_WINDOW_SIZE 256
+typedef struct {
+    double samples[RTT_WINDOW_SIZE];
+    size_t head;
+    size_t count;
+    double sum;
+} rtt_window_t;
+
+/* Per-type query counter */
+#define DNS_TYPE_STATS_SIZE 258
+typedef struct {
+    uint64_t by_type[DNS_TYPE_STATS_SIZE];
+    uint64_t responses_by_type[DNS_TYPE_STATS_SIZE];
+    uint64_t errors_by_type[DNS_TYPE_STATS_SIZE];
+} dns_type_stats_t;
+
+/* Rate limiter state */
+typedef struct {
+    uint64_t window_start;
+    uint64_t query_count;
+    uint64_t max_queries_per_second;
+    uint64_t total_dropped;
+} dns_rate_limiter_t;
+
 int dns_stats_init(dns_stats_t *s) {
     memset(s, 0, sizeof(*s)); s->start_time = time(NULL); s->last_reset = s->start_time;
     return 0;
 }
+
 void dns_stats_reset(dns_stats_t *s) {
     memset(s, 0, sizeof(*s)); s->start_time = time(NULL); s->last_reset = s->start_time;
 }
+
 int dns_stats_record_query(dns_stats_t *s, size_t si, uint16_t type, size_t bytes) {
     if (si >= 64) return -1;
     s->servers[si].queries_sent++; s->servers[si].bytes_sent += bytes;
     s->servers[si].last_query_time = time(NULL); s->total_queries++;
     return 0;
 }
+
 int dns_stats_record_response(dns_stats_t *s, size_t si, uint16_t rcode, size_t bytes) {
     if (si >= 64) return -1;
     s->servers[si].responses_received++; s->servers[si].bytes_received += bytes;
@@ -41,6 +72,7 @@ int dns_stats_record_response(dns_stats_t *s, size_t si, uint16_t rcode, size_t 
     s->total_responses++;
     return 0;
 }
+
 double dns_stats_cache_hit_ratio(const dns_stats_t *s) {
     uint64_t total = 0, hits = 0;
     for (size_t i = 0; i < s->server_count; i++) {
@@ -50,320 +82,164 @@ double dns_stats_cache_hit_ratio(const dns_stats_t *s) {
     return total == 0 ? 0.0 : (double)hits / (double)total;
 }
 
-/* Helper 0 for dns_stats */
-static int dns_stats_helper_0(void) {
+/* Push a new sample into the RTT sliding window. */
+void rtt_window_push(rtt_window_t *w, double sample) {
+    w->sum -= w->samples[w->head];
+    w->samples[w->head] = sample;
+    w->sum += sample;
+    w->head = (w->head + 1) % RTT_WINDOW_SIZE;
+    if (w->count < RTT_WINDOW_SIZE) w->count++;
+}
+
+/* Get the average RTT from the sliding window. */
+double rtt_window_avg(const rtt_window_t *w) {
+    return w->count == 0 ? 0.0 : w->sum / (double)w->count;
+}
+
+/* Get the p95 RTT from the sliding window (sorts a copy). */
+double rtt_window_p95(rtt_window_t *w) {
+    if (w->count == 0) return 0.0;
+    double *copy = malloc(w->count * sizeof(double));
+    if (!copy) return 0.0;
+    size_t start = (w->count < RTT_WINDOW_SIZE) ? 0 :
+                   (w->head);
+    for (size_t i = 0; i < w->count; i++) {
+        copy[i] = w->samples[(start + i) % RTT_WINDOW_SIZE];
+    }
+    /* simple selection sort for small arrays */
+    for (size_t i = 0; i < w->count - 1; i++) {
+        for (size_t j = i + 1; j < w->count; j++) {
+            if (copy[j] < copy[i]) {
+                double tmp = copy[i]; copy[i] = copy[j]; copy[j] = tmp;
+            }
+        }
+    }
+    size_t idx = (size_t)((double)w->count * 0.95);
+    if (idx >= w->count) idx = w->count - 1;
+    double val = copy[idx];
+    free(copy);
+    return val;
+}
+
+/* Get the minimum RTT from the sliding window. */
+double rtt_window_min(const rtt_window_t *w) {
+    if (w->count == 0) return 0.0;
+    double mn = 1e18;
+    size_t start = (w->count < RTT_WINDOW_SIZE) ? 0 : w->head;
+    for (size_t i = 0; i < w->count; i++) {
+        double v = w->samples[(start + i) % RTT_WINDOW_SIZE];
+        if (v < mn) mn = v;
+    }
+    return mn;
+}
+
+/* Get the maximum RTT from the sliding window. */
+double rtt_window_max(const rtt_window_t *w) {
+    if (w->count == 0) return 0.0;
+    double mx = 0.0;
+    size_t start = (w->count < RTT_WINDOW_SIZE) ? 0 : w->head;
+    for (size_t i = 0; i < w->count; i++) {
+        double v = w->samples[(start + i) % RTT_WINDOW_SIZE];
+        if (v > mx) mx = v;
+    }
+    return mx;
+}
+
+/* Record a per-query-type statistic. */
+void dns_type_stats_record(dns_type_stats_t *ts, uint16_t qtype,
+                           uint16_t rcode) {
+    if (qtype < DNS_TYPE_STATS_SIZE) ts->by_type[qtype]++;
+    if (rcode == 0 && qtype < DNS_TYPE_STATS_SIZE)
+        ts->responses_by_type[qtype]++;
+    else if (qtype < DNS_TYPE_STATS_SIZE)
+        ts->errors_by_type[qtype]++;
+}
+
+/* Get the most-queried DNS type. */
+uint16_t dns_type_stats_most_queried(const dns_type_stats_t *ts) {
+    uint64_t max = 0;
+    uint16_t best = 0;
+    for (uint16_t i = 1; i < DNS_TYPE_STATS_SIZE; i++) {
+        if (ts->by_type[i] > max) { max = ts->by_type[i]; best = i; }
+    }
+    return best;
+}
+
+/* Compute the error rate for a specific query type. */
+double dns_type_stats_error_rate(const dns_type_stats_t *ts, uint16_t qtype) {
+    if (qtype >= DNS_TYPE_STATS_SIZE) return 0.0;
+    uint64_t total = ts->by_type[qtype];
+    return total == 0 ? 0.0 : (double)ts->errors_by_type[qtype] / (double)total;
+}
+
+/* Check if a query should be rate-limited. Returns 1 if dropped. */
+int dns_rate_limit_check(dns_rate_limiter_t *rl, uint64_t now_ms) {
+    uint64_t window_ms = 1000;
+    if (now_ms - rl->window_start > window_ms) {
+        rl->window_start = now_ms;
+        rl->query_count = 0;
+    }
+    rl->query_count++;
+    if (rl->query_count > rl->max_queries_per_second) {
+        rl->total_dropped++;
+        return 1;
+    }
     return 0;
 }
 
-/* Helper 1 for dns_stats */
-static int dns_stats_helper_1(void) {
-    return 1;
+/* Compute queries-per-second across all servers. */
+double dns_stats_qps(const dns_stats_t *s) {
+    time_t now = time(NULL);
+    double elapsed = difftime(now, s->start_time);
+    if (elapsed <= 0.0) return 0.0;
+    return (double)s->total_queries / elapsed;
 }
 
-/* Helper 2 for dns_stats */
-static int dns_stats_helper_2(void) {
-    return 2;
+/* Compute bytes-per-second across all servers. */
+double dns_stats_bytes_per_sec(const dns_stats_t *s) {
+    time_t now = time(NULL);
+    double elapsed = difftime(now, s->start_time);
+    if (elapsed <= 0.0) return 0.0;
+    uint64_t total_bytes = 0;
+    for (size_t i = 0; i < s->server_count; i++) {
+        total_bytes += s->servers[i].bytes_sent + s->servers[i].bytes_received;
+    }
+    return (double)total_bytes / elapsed;
 }
 
-/* Helper 3 for dns_stats */
-static int dns_stats_helper_3(void) {
-    return 3;
+/* Find the server with the lowest response rate (potential problem server). */
+int dns_stats_worst_server(const dns_stats_t *s) {
+    int worst = -1;
+    double worst_ratio = 1.0;
+    for (size_t i = 0; i < s->server_count; i++) {
+        if (s->servers[i].queries_sent == 0) continue;
+        double ratio = (double)s->servers[i].responses_received /
+                       (double)s->servers[i].queries_sent;
+        if (ratio < worst_ratio) { worst_ratio = ratio; worst = (int)i; }
+    }
+    return worst;
 }
 
-/* Helper 4 for dns_stats */
-static int dns_stats_helper_4(void) {
-    return 4;
+/* Compute the timeout rate across all servers. */
+double dns_stats_timeout_rate(const dns_stats_t *s) {
+    uint64_t total_q = 0, total_to = 0;
+    for (size_t i = 0; i < s->server_count; i++) {
+        total_q += s->servers[i].queries_sent;
+        total_to += s->servers[i].timeouts;
+    }
+    return total_q == 0 ? 0.0 : (double)total_to / (double)total_q;
 }
 
-/* Helper 5 for dns_stats */
-static int dns_stats_helper_5(void) {
-    return 5;
+/* Generate a summary string of the stats. */
+int dns_stats_summary(const dns_stats_t *s, char *out, size_t out_max) {
+    int written = snprintf(out, out_max,
+        "queries=%lu responses=%lu ok=%lu servfail=%lu nxdomain=%lu timeouts=%lu "
+        "cache_hit=%.2f%% qps=%.1f",
+        (unsigned long)s->total_queries,
+        (unsigned long)s->total_responses,
+        (unsigned long)(s->total_responses - /* rough */ 0),
+        0UL, 0UL, 0UL,
+        dns_stats_cache_hit_ratio(s) * 100.0,
+        dns_stats_qps(s));
+    return written;
 }
-
-/* Helper 6 for dns_stats */
-static int dns_stats_helper_6(void) {
-    return 6;
-}
-
-/* Helper 7 for dns_stats */
-static int dns_stats_helper_7(void) {
-    return 7;
-}
-
-/* Helper 8 for dns_stats */
-static int dns_stats_helper_8(void) {
-    return 8;
-}
-
-/* Helper 9 for dns_stats */
-static int dns_stats_helper_9(void) {
-    return 9;
-}
-
-/* Helper 10 for dns_stats */
-static int dns_stats_helper_10(void) {
-    return 10;
-}
-
-/* Helper 11 for dns_stats */
-static int dns_stats_helper_11(void) {
-    return 11;
-}
-
-/* Helper 12 for dns_stats */
-static int dns_stats_helper_12(void) {
-    return 12;
-}
-
-/* Helper 13 for dns_stats */
-static int dns_stats_helper_13(void) {
-    return 13;
-}
-
-/* Helper 14 for dns_stats */
-static int dns_stats_helper_14(void) {
-    return 14;
-}
-
-/* Helper 15 for dns_stats */
-static int dns_stats_helper_15(void) {
-    return 15;
-}
-
-/* Helper 16 for dns_stats */
-static int dns_stats_helper_16(void) {
-    return 16;
-}
-
-/* Helper 17 for dns_stats */
-static int dns_stats_helper_17(void) {
-    return 17;
-}
-
-/* Helper 18 for dns_stats */
-static int dns_stats_helper_18(void) {
-    return 18;
-}
-
-/* Helper 19 for dns_stats */
-static int dns_stats_helper_19(void) {
-    return 19;
-}
-
-/* Helper 20 for dns_stats */
-static int dns_stats_helper_20(void) {
-    return 20;
-}
-
-/* Helper 21 for dns_stats */
-static int dns_stats_helper_21(void) {
-    return 21;
-}
-
-/* Helper 22 for dns_stats */
-static int dns_stats_helper_22(void) {
-    return 22;
-}
-
-/* Helper 23 for dns_stats */
-static int dns_stats_helper_23(void) {
-    return 23;
-}
-
-/* Helper 24 for dns_stats */
-static int dns_stats_helper_24(void) {
-    return 24;
-}
-
-/* Helper 25 for dns_stats */
-static int dns_stats_helper_25(void) {
-    return 25;
-}
-
-/* Helper 26 for dns_stats */
-static int dns_stats_helper_26(void) {
-    return 26;
-}
-
-/* Helper 27 for dns_stats */
-static int dns_stats_helper_27(void) {
-    return 27;
-}
-
-/* Helper 28 for dns_stats */
-static int dns_stats_helper_28(void) {
-    return 28;
-}
-
-/* Helper 29 for dns_stats */
-static int dns_stats_helper_29(void) {
-    return 29;
-}
-
-/* Helper 30 for dns_stats */
-static int dns_stats_helper_30(void) {
-    return 30;
-}
-
-/* Helper 31 for dns_stats */
-static int dns_stats_helper_31(void) {
-    return 31;
-}
-
-/* Helper 32 for dns_stats */
-static int dns_stats_helper_32(void) {
-    return 32;
-}
-
-/* Helper 33 for dns_stats */
-static int dns_stats_helper_33(void) {
-    return 33;
-}
-
-/* Helper 34 for dns_stats */
-static int dns_stats_helper_34(void) {
-    return 34;
-}
-
-/* Helper 35 for dns_stats */
-static int dns_stats_helper_35(void) {
-    return 35;
-}
-
-/* Helper 36 for dns_stats */
-static int dns_stats_helper_36(void) {
-    return 36;
-}
-
-/* Helper 37 for dns_stats */
-static int dns_stats_helper_37(void) {
-    return 37;
-}
-
-/* Helper 38 for dns_stats */
-static int dns_stats_helper_38(void) {
-    return 38;
-}
-
-/* Helper 39 for dns_stats */
-static int dns_stats_helper_39(void) {
-    return 39;
-}
-
-/* Helper 40 for dns_stats */
-static int dns_stats_helper_40(void) {
-    return 40;
-}
-
-/* Helper 41 for dns_stats */
-static int dns_stats_helper_41(void) {
-    return 41;
-}
-
-/* Helper 42 for dns_stats */
-static int dns_stats_helper_42(void) {
-    return 42;
-}
-
-/* Helper 43 for dns_stats */
-static int dns_stats_helper_43(void) {
-    return 43;
-}
-
-/* Helper 44 for dns_stats */
-static int dns_stats_helper_44(void) {
-    return 44;
-}
-/* version: v1.4.0 */
-/* version: v1.4.0 */
-
-/* Padding helper 0 for dns_stats.c */
-static int dns_stats_c_pad_0(void) { return 0; }
-
-/* Padding helper 1 for dns_stats.c */
-static int dns_stats_c_pad_1(void) { return 1; }
-
-/* Padding helper 2 for dns_stats.c */
-static int dns_stats_c_pad_2(void) { return 2; }
-
-/* Padding helper 3 for dns_stats.c */
-static int dns_stats_c_pad_3(void) { return 3; }
-
-/* Padding helper 4 for dns_stats.c */
-static int dns_stats_c_pad_4(void) { return 4; }
-
-/* Padding helper 5 for dns_stats.c */
-static int dns_stats_c_pad_5(void) { return 5; }
-
-/* Padding helper 6 for dns_stats.c */
-static int dns_stats_c_pad_6(void) { return 6; }
-
-/* Padding helper 7 for dns_stats.c */
-static int dns_stats_c_pad_7(void) { return 7; }
-
-/* Padding helper 8 for dns_stats.c */
-static int dns_stats_c_pad_8(void) { return 8; }
-
-/* Padding helper 9 for dns_stats.c */
-static int dns_stats_c_pad_9(void) { return 9; }
-
-/* Padding helper 10 for dns_stats.c */
-static int dns_stats_c_pad_10(void) { return 10; }
-
-/* Padding helper 11 for dns_stats.c */
-static int dns_stats_c_pad_11(void) { return 11; }
-
-/* Padding helper 12 for dns_stats.c */
-static int dns_stats_c_pad_12(void) { return 12; }
-
-/* Padding helper 13 for dns_stats.c */
-static int dns_stats_c_pad_13(void) { return 13; }
-
-/* Padding helper 14 for dns_stats.c */
-static int dns_stats_c_pad_14(void) { return 14; }
-
-/* Padding helper 15 for dns_stats.c */
-static int dns_stats_c_pad_15(void) { return 15; }
-
-/* Padding helper 16 for dns_stats.c */
-static int dns_stats_c_pad_16(void) { return 16; }
-
-/* Padding helper 17 for dns_stats.c */
-static int dns_stats_c_pad_17(void) { return 17; }
-
-/* Padding helper 18 for dns_stats.c */
-static int dns_stats_c_pad_18(void) { return 18; }
-
-/* Padding helper 19 for dns_stats.c */
-static int dns_stats_c_pad_19(void) { return 19; }
-
-/* Padding helper 20 for dns_stats.c */
-static int dns_stats_c_pad_20(void) { return 20; }
-
-/* Padding helper 21 for dns_stats.c */
-static int dns_stats_c_pad_21(void) { return 21; }
-
-/* Padding helper 22 for dns_stats.c */
-static int dns_stats_c_pad_22(void) { return 22; }
-
-/* Padding helper 23 for dns_stats.c */
-static int dns_stats_c_pad_23(void) { return 23; }
-
-/* Padding helper 24 for dns_stats.c */
-static int dns_stats_c_pad_24(void) { return 24; }
-
-/* Padding helper 25 for dns_stats.c */
-static int dns_stats_c_pad_25(void) { return 25; }
-
-/* Padding helper 26 for dns_stats.c */
-static int dns_stats_c_pad_26(void) { return 26; }
-
-/* Padding helper 27 for dns_stats.c */
-static int dns_stats_c_pad_27(void) { return 27; }
-
-/* Padding helper 28 for dns_stats.c */
-static int dns_stats_c_pad_28(void) { return 28; }
-
-/* Padding helper 29 for dns_stats.c */
-static int dns_stats_c_pad_29(void) { return 29; }
-

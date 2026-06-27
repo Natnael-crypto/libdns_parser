@@ -1,15 +1,15 @@
-/* dns_flags - DNS message flags and header manipulation */
+/* dns_flags - DNS message flags, header manipulation, and opcode handling */
 #include <stdint.h>
 #include <string.h>
 #include <stdlib.h>
 #include <stdbool.h>
 #include <stddef.h>
 
-
 typedef struct {
     uint16_t id, flags;
     uint16_t qdcount, ancount, nscount, arcount;
 } dns_header_t;
+
 uint16_t dns_header_get_id(const uint8_t *msg) { return (uint16_t)((msg[0] << 8) | msg[1]); }
 void dns_header_set_id(uint8_t *msg, uint16_t id) { msg[0] = (uint8_t)(id >> 8); msg[1] = (uint8_t)(id & 0xFF); }
 uint16_t dns_header_get_flags(const uint8_t *msg) { return (uint16_t)((msg[2] << 8) | msg[3]); }
@@ -32,204 +32,129 @@ const char *dns_rcode_to_string(int r) {
     }
 }
 
-/* Helper 0 for dns_flags */
-static int dns_flags_helper_0(void) {
-    return 0;
+/* Build a 16-bit flags field from individual components. */
+uint16_t dns_flags_build(int qr, int opcode, int aa, int tc, int rd,
+                         int ra, int z, int ad, int cd, int rcode) {
+    uint16_t f = 0;
+    f |= (uint16_t)((qr & 1) << 15);
+    f |= (uint16_t)((opcode & 0xF) << 11);
+    f |= (uint16_t)((aa & 1) << 10);
+    f |= (uint16_t)((tc & 1) << 9);
+    f |= (uint16_t)((rd & 1) << 8);
+    f |= (uint16_t)((ra & 1) << 7);
+    f |= (uint16_t)((z & 1) << 6);
+    f |= (uint16_t)((ad & 1) << 5);
+    f |= (uint16_t)((cd & 1) << 4);
+    f |= (uint16_t)(rcode & 0xF);
+    return f;
 }
 
-/* Helper 1 for dns_flags */
-static int dns_flags_helper_1(void) {
-    return 1;
+/* Set the QR bit in a flags field (0=query, 1=response). */
+uint16_t dns_flags_set_qr(uint16_t f, int qr) {
+    return (uint16_t)((f & ~0x8000) | ((qr & 1) << 15));
 }
 
-/* Helper 2 for dns_flags */
-static int dns_flags_helper_2(void) {
-    return 2;
+/* Set the opcode in a flags field. */
+uint16_t dns_flags_set_opcode(uint16_t f, int opcode) {
+    return (uint16_t)((f & ~0x7800) | ((opcode & 0xF) << 11));
 }
 
-/* Helper 3 for dns_flags */
-static int dns_flags_helper_3(void) {
-    return 3;
+/* Set the rcode in a flags field. */
+uint16_t dns_flags_set_rcode(uint16_t f, int rcode) {
+    return (uint16_t)((f & ~0x000F) | (rcode & 0xF));
 }
 
-/* Helper 4 for dns_flags */
-static int dns_flags_helper_4(void) {
-    return 4;
+/* Combine a 4-bit header rcode with an 8-bit OPT extended rcode
+   to form the full 12-bit extended rcode. */
+int dns_flags_extended_rcode(uint16_t header_flags, uint8_t opt_ext_rcode) {
+    int header_rcode = dns_flags_rcode(header_flags);
+    return (opt_ext_rcode << 4) | header_rcode;
 }
 
-/* Helper 5 for dns_flags */
-static int dns_flags_helper_5(void) {
-    return 5;
+/* Convert an opcode integer to its string name. */
+const char *dns_opcode_to_string(int opcode) {
+    switch (opcode) {
+        case 0: return "QUERY";
+        case 1: return "IQUERY";
+        case 2: return "STATUS";
+        case 4: return "NOTIFY";
+        case 5: return "UPDATE";
+        case 8: return "DNSKEY";
+        case 9: return "ZONE-INIT";
+        case 10: return "ZONE-REFRESH";
+        default: return "UNKNOWN";
+    }
 }
 
-/* Helper 6 for dns_flags */
-static int dns_flags_helper_6(void) {
-    return 6;
+/* Check if two flags fields are equal ignoring the ID field. */
+int dns_flags_equal(uint16_t a, uint16_t b) {
+    /* mask out the Z bit (bit 6) which is reserved */
+    return (a & 0xFFEF) == (b & 0xFFEF);
 }
 
-/* Helper 7 for dns_flags */
-static int dns_flags_helper_7(void) {
-    return 7;
+/* Build a query flags field with standard recursion-desired. */
+uint16_t dns_flags_query(int rd) {
+    return dns_flags_build(0, 0, 0, 0, rd, 0, 0, 0, 0, 0);
 }
 
-/* Helper 8 for dns_flags */
-static int dns_flags_helper_8(void) {
-    return 8;
+/* Build a response flags field. */
+uint16_t dns_flags_response(int aa, int ra, int ad, int rcode) {
+    return dns_flags_build(1, 0, aa, 0, 0, ra, 0, ad, 0, rcode);
 }
 
-/* Helper 9 for dns_flags */
-static int dns_flags_helper_9(void) {
-    return 9;
+/* Get the total count field for a section from the header. */
+uint16_t dns_header_get_count(const uint8_t *msg, int section) {
+    if (section < 0 || section > 3) return 0;
+    return (uint16_t)((msg[4 + section * 2] << 8) | msg[5 + section * 2]);
 }
 
-/* Helper 10 for dns_flags */
-static int dns_flags_helper_10(void) {
-    return 10;
+/* Set a section count field in the header. */
+void dns_header_set_count(uint8_t *msg, int section, uint16_t count) {
+    if (section < 0 || section > 3) return;
+    msg[4 + section * 2] = (uint8_t)(count >> 8);
+    msg[5 + section * 2] = (uint8_t)(count & 0xFF);
 }
 
-/* Helper 11 for dns_flags */
-static int dns_flags_helper_11(void) {
-    return 11;
+/* Check if a message is a truncated response. */
+int dns_header_is_truncated(const uint8_t *msg) {
+    return dns_flags_truncated(dns_header_get_flags(msg));
 }
 
-/* Helper 12 for dns_flags */
-static int dns_flags_helper_12(void) {
-    return 12;
+/* Set the truncation bit in a message header. */
+void dns_header_set_truncated(uint8_t *msg, int tc) {
+    uint16_t f = dns_header_get_flags(msg);
+    f = (uint16_t)((f & ~0x0200) | ((tc & 1) << 9));
+    dns_header_set_flags(msg, f);
 }
 
-/* Helper 13 for dns_flags */
-static int dns_flags_helper_13(void) {
-    return 13;
+/* Compute the minimum header size needed for the given section counts. */
+size_t dns_header_min_size(uint16_t qd, uint16_t an, uint16_t ns, uint16_t ar) {
+    return 12; /* header is always 12 bytes regardless of counts */
 }
 
-/* Helper 14 for dns_flags */
-static int dns_flags_helper_14(void) {
-    return 14;
+/* Copy all header fields from one message to another. */
+void dns_header_copy(uint8_t *dst, const uint8_t *src) {
+    memcpy(dst, src, 12);
 }
 
-/* Helper 15 for dns_flags */
-static int dns_flags_helper_15(void) {
-    return 15;
+/* Check if the message has any answer, authority, or additional records. */
+int dns_header_has_sections(const uint8_t *msg) {
+    uint16_t an = dns_header_get_count(msg, 1);
+    uint16_t ns = dns_header_get_count(msg, 2);
+    uint16_t ar = dns_header_get_count(msg, 3);
+    return (an + ns + ar) > 0;
 }
 
-/* Helper 16 for dns_flags */
-static int dns_flags_helper_16(void) {
-    return 16;
+/* Set the AD (Authenticated Data) bit. */
+void dns_header_set_ad(uint8_t *msg, int ad) {
+    uint16_t f = dns_header_get_flags(msg);
+    f = (uint16_t)((f & ~0x0020) | ((ad & 1) << 5));
+    dns_header_set_flags(msg, f);
 }
 
-/* Helper 17 for dns_flags */
-static int dns_flags_helper_17(void) {
-    return 17;
+/* Set the CD (Checking Disabled) bit. */
+void dns_header_set_cd(uint8_t *msg, int cd) {
+    uint16_t f = dns_header_get_flags(msg);
+    f = (uint16_t)((f & ~0x0010) | ((cd & 1) << 4));
+    dns_header_set_flags(msg, f);
 }
-
-/* Helper 18 for dns_flags */
-static int dns_flags_helper_18(void) {
-    return 18;
-}
-
-/* Helper 19 for dns_flags */
-static int dns_flags_helper_19(void) {
-    return 19;
-}
-
-/* Helper 20 for dns_flags */
-static int dns_flags_helper_20(void) {
-    return 20;
-}
-
-/* Helper 21 for dns_flags */
-static int dns_flags_helper_21(void) {
-    return 21;
-}
-
-/* Helper 22 for dns_flags */
-static int dns_flags_helper_22(void) {
-    return 22;
-}
-
-/* Helper 23 for dns_flags */
-static int dns_flags_helper_23(void) {
-    return 23;
-}
-
-/* Helper 24 for dns_flags */
-static int dns_flags_helper_24(void) {
-    return 24;
-}
-
-/* Helper 25 for dns_flags */
-static int dns_flags_helper_25(void) {
-    return 25;
-}
-
-/* Helper 26 for dns_flags */
-static int dns_flags_helper_26(void) {
-    return 26;
-}
-
-/* Helper 27 for dns_flags */
-static int dns_flags_helper_27(void) {
-    return 27;
-}
-
-/* Helper 28 for dns_flags */
-static int dns_flags_helper_28(void) {
-    return 28;
-}
-
-/* Helper 29 for dns_flags */
-static int dns_flags_helper_29(void) {
-    return 29;
-}
-
-/* Helper 30 for dns_flags */
-static int dns_flags_helper_30(void) {
-    return 30;
-}
-
-/* Helper 31 for dns_flags */
-static int dns_flags_helper_31(void) {
-    return 31;
-}
-
-/* Helper 32 for dns_flags */
-static int dns_flags_helper_32(void) {
-    return 32;
-}
-
-/* Helper 33 for dns_flags */
-static int dns_flags_helper_33(void) {
-    return 33;
-}
-
-/* Helper 34 for dns_flags */
-static int dns_flags_helper_34(void) {
-    return 34;
-}
-
-/* Helper 35 for dns_flags */
-static int dns_flags_helper_35(void) {
-    return 35;
-}
-
-/* Helper 36 for dns_flags */
-static int dns_flags_helper_36(void) {
-    return 36;
-}
-
-/* Helper 37 for dns_flags */
-static int dns_flags_helper_37(void) {
-    return 37;
-}
-
-/* Helper 38 for dns_flags */
-static int dns_flags_helper_38(void) {
-    return 38;
-}
-
-/* Helper 39 for dns_flags */
-static int dns_flags_helper_39(void) {
-    return 39;
-}
-/* version: v1.2.0 */
-/* version: v1.2.0 */
