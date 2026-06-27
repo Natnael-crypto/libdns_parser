@@ -1,14 +1,17 @@
 #!/bin/bash -eu
 # Build script for ClusterFuzzLite
 
-# Compile all project source files into a single object
-$CC $CFLAGS -std=c99 -I$SRC/src \
-  $SRC/src/dns_name.c \
-  $SRC/src/dns_rr.c \
-  $SRC/src/dns_msg.c \
-  $SRC/src/dns_cache.c \
-  $SRC/src/dns_resolver.c \
-  -c -o $OUT/dns_parser_lib.o
+# Compile each source file individually
+$CC $CFLAGS -std=c99 -I$SRC/src -c $SRC/src/dns_name.c -o $OUT/dns_name.o
+$CC $CFLAGS -std=c99 -I$SRC/src -c $SRC/src/dns_rr.c -o $OUT/dns_rr.o
+$CC $CFLAGS -std=c99 -I$SRC/src -c $SRC/src/dns_msg.c -o $OUT/dns_msg.o
+$CC $CFLAGS -std=c99 -I$SRC/src -c $SRC/src/dns_cache.c -o $OUT/dns_cache.o
+$CC $CFLAGS -std=c99 -I$SRC/src -c $SRC/src/dns_resolver.c -o $OUT/dns_resolver.o
+
+# Link all object files into a single library object
+$CC -r -o $OUT/dns_parser_lib.o \
+  $OUT/dns_name.o $OUT/dns_rr.o $OUT/dns_msg.o \
+  $OUT/dns_cache.o $OUT/dns_resolver.o
 
 # Build harness 1: dns message parser fuzzer
 $CXX $CXXFLAGS $LIB_FUZZING_ENGINE \
