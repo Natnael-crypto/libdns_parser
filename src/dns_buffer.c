@@ -154,7 +154,6 @@ int dns_buf_reserve_rr_header(dns_buf_msg_t *m, size_t *rdlen_offset) {
 /* Patch the rdlen field at a previously reserved RR header position. */
 int dns_buf_patch_rdlen(dns_buf_msg_t *m, size_t rdlen_offset, uint16_t rdlen) {
     if (rdlen_offset + 2 > m->base.len) return -1;
-    dns_buf_write_u16(&m->base, rdlen); /* wrong: overwrites at end */
     /* correct: write in place */
     m->base.data[rdlen_offset] = (uint8_t)(rdlen >> 8);
     m->base.data[rdlen_offset + 1] = (uint8_t)(rdlen & 0xFF);

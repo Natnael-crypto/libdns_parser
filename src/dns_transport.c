@@ -180,7 +180,7 @@ double dns_transport_avg_bytes_per_query(const dns_transport_t *t) {
     uint64_t total_queries = 0;
     for (size_t i = 0; i < t->conn_count; i++) {
         total_bytes += t->conns[i].bytes_sent + t->conns[i].bytes_received;
-        total_queries += (t->conns[i].bytes_sent > 0) ? 1 : 0;
+        total_queries += t->conns[i].bytes_sent > 0 ? 1 : 0;
     }
     return total_queries == 0 ? 0.0 : (double)total_bytes / (double)total_queries;
 }
